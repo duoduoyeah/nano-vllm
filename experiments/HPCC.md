@@ -12,11 +12,23 @@ your cluster's values (`sinfo`, `module avail`).
   `export SCRATCH=<your scratch or /bigdata path>`
 - **Code → anywhere** (home is fine; it's small).
 
-## 1. Get the code
+## 1. Get the code (SSH)
+
+Get a GitHub SSH key working on HPCC — two ways:
+- **Agent forwarding (recommended — no private key on the shared cluster):** from the
+  laptop, `ssh -A <user>@<hpcc>` (key loaded: check `ssh-add -l`).
+- **Key on HPCC:** `ssh-keygen -t ed25519 -C "<email>"`, then add `~/.ssh/id_ed25519.pub`
+  to GitHub (Settings → SSH keys, or as a repo Deploy key). One-time.
+
+Verify, then clone:
 ```bash
-git clone -b project https://github.com/duoduoyeah/nano-vllm.git
-cd nano-vllm                       # (or: git pull, if already cloned)
+ssh -T git@github.com                                      # should greet you by username
+git clone -b project git@github.com:duoduoyeah/nano-vllm.git
+cd nano-vllm                                               # (or: git pull, if already cloned)
 ```
+> The fork mirrors a public repo: if it's **public**, skip SSH and clone over HTTPS
+> (`https://github.com/duoduoyeah/nano-vllm.git`, no auth). Use SSH if it's **private**
+> or you'll **push** from HPCC.
 
 ## 2. Python env (Python 3.10–3.12; NOT 3.13)
 ```bash
