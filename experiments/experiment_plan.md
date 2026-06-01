@@ -93,6 +93,16 @@ Qwen3-32B · TP=4 on 4× RTX PRO 6000 Blackwell (**PCIe, no NVLink**) · T=256 d
 **Deliverables:** `results/vanilla.csv` (K=1 baseline, 8 rows) · `results/sweep.csv` (35 rows: 32 ok + 3 OOM) · `results/fig1–4.png`.
 Grid: K ∈ {1, 16, 32, 64, 256}, S ∈ {1, 2, 16} (for K=16), B ∈ {1, 64, 128} @ prefix 1K / B ∈ {1, 64} @ prefix 10K.
 
+**Pull the outputs to local (scp).** `results/*.csv` and `*.png` are gitignored (not committed), so copy
+them from HPCC. Use the **`hpcc-sli-login`** SSH alias — the **login** node (always use the `*-login`
+alias for transfers, not the compute-node one; both are defined in `~/.ssh/config`). Quote remote globs
+so they expand on HPCC, not locally:
+
+```bash
+R=/bigdata/blilab/sli588/cs213/nano-vllm/experiments/results
+scp "hpcc-sli-login:$R/vanilla.csv" "hpcc-sli-login:$R/sweep.csv" "hpcc-sli-login:$R/fig*.png" ./results/
+```
+
 ### Throughput (tok/s), S=1 (eff = K)
 | B | K=1 | K=16 | K=32 | K=64 | K=256 |
 |--:|--:|--:|--:|--:|--:|
