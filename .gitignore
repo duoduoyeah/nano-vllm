@@ -193,3 +193,16 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# --- Project: local model cache & external downloads (see experiments/env.sh) ---
+# Every HuggingFace / torch / triton / pip download is routed into .cache/ so the
+# whole thing is disposable (rm -rf .cache to reclaim space). Never committed.
+# (`.cache` is already matched above; these anchor the intent and cover weights/logs.)
+/.cache/
+# SLURM job logs if written into the experiments dir
+experiments/slurm-*.out
+experiments/slurm_logs/
+# Experiment OUTPUTS — delivered via results/ (scp), not version-controlled; commit code/docs only.
+experiments/results/*.csv
+experiments/results/*.png
+experiments/results/parts/

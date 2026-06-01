@@ -15,7 +15,7 @@ Total VRAM  ≈  Weights  +  KV cache  +  overhead
 W = N_total × b
 ```
 
-- `N_total` = **total** parameter count. For **MoE**, this is *all* experts (they must be resident). Active params reduce compute/FLOPs, **not** weight memory.
+- `N_total` = total parameter count. Qwen3-32B is **dense**, so every parameter is resident and active.
 - `b` = bytes per parameter:
 
 | precision | b (bytes/param) |
@@ -38,50 +38,67 @@ KV = 2 · L · H_kv · d_head · L_seq · B · b_kv
 
 ### Overhead
 
-Activations + framework ≈ **+10–20%**. Inference activations are small; MoE computes only the active experts. Our B/K/S decode runs `B×K` query positions per forward (vs `B×1` for AR), inflating *transient activation* but not KV.
+Activations + framework ≈ **+10–20%**. Inference activations are small. Our B/K/S decode runs
+`B×K` query positions per forward (vs `B×1` for AR), inflating *transient activation* but not KV.
 
-## 2. Models we'll use
+## 2. The model — Qwen3-32B (dense AR, B/K/S emulation)
 
-### LLaDA2.0-flash (100B) — native masked-diffusion reference
-
-Config: `L=32`, `H_kv=4`, `d_head=128`, 256 experts (8 active), BF16 release · 100B total / 6.1B active.
-
-| | INT4 | INT8 | BF16 |
-|---|---|---|---|
-| **Weights** (`100B × b`) | 50 GB | 100 GB | 200 GB |
-
-KV/token (FP16) = `2·32·4·128·2` = **64 KB** (upper bound — flash uses sliding-window attention on most layers, so the real value is lower).
-Worst sweep corner `B=64 × 10K` ≈ 640K tokens → **~42 GB** KV.
-
-| Worst-corner total (W + KV + 15%) | INT4 | INT8 | BF16 |
-|---|---|---|---|
-| total | ~106 GB | ~163 GB | ~278 GB |
-| cards (96 GB each) | 2 | 2–3 | 3–4 |
-
-→ **Even BF16 fits in 384 GB.** Quantization is *optional* for flash; released weights are BF16, so BF16 is the zero-effort path. INT8 for extra headroom; INT4 unnecessary.
-
-### Vanilla AR model (B/K/S emulation) — practical path
-
-We may not run LLaDA's diffusion decode at all. Instead, take a **normal autoregressive model that nano-vLLM already supports** and **impose the (B, K, S) decode pattern** on it:
+We don't run a real diffusion / multi-token model. We take a **normal autoregressive model that
+nano-vLLM already supports** and **impose the (B, K, S) decode pattern** on it:
 
 - AR baseline `(K=1, S=1)`: 1 token/step/request (native).
 - Multi-token: present **K query positions per request per forward**, repeat **S forwards** before committing K tokens.
 
-We measure **system cost (throughput/latency), not output quality** — so the emulated compute/memory pattern is what matters; the generated text can be meaningless. The recently-merged **chunked-prefill** path provides the multi-position-forward primitive this needs, so we avoid implementing diffusion.
+We measure **system cost (throughput/latency), not output quality** — so the emulated compute/memory
+pattern is what matters; the generated text can be meaningless. The merged **chunked-prefill** path
+provides the multi-position-forward primitive this needs, so we avoid implementing diffusion.
 
-Memory uses the same equations; numbers depend on the chosen model.
+**Config** (`config.json`): `L=64`, `hidden=5120`, 64 attention heads, `H_kv=8` (GQA), `d_head=128`,
+`vocab=151936`, native ctx `40960`, BF16 release. **≈ 32.8B params** (dense).
 
-> **TBD — which AR model.** Must be nano-vLLM-supported (Qwen2/Qwen3 family). Pick the size to match the study (≈100B to mirror flash, or smaller for faster iteration). Fill weights/KV here once chosen.
+### Weights
+
+| | INT4 | INT8 | BF16 |
+|---|---|---|---|
+| **Weights** (`32.8B × b`) | ~16.4 GB | ~32.8 GB | **~65.5 GB** |
+
+BF16 is the released format and the zero-effort path (matches the ~65.5 GB on-disk download).
+Quantization is optional — only for extra headroom or if we want to *study* quantization.
+
+### KV cache
+
+```
+KV/token (FP16) = 2 · 64 · 8 · 128 · 2  =  262,144 B  =  256 KB/token
+```
+
+| sweep corner (FP16 KV) | tokens (B × L_seq) | KV |
+|---|---|---|
+| B=1 × 1K   | 1,024      | ~0.27 GB |
+| B=64 × 1K  | 65,536     | ~17 GB |
+| B=1 × 10K  | 10,240     | ~2.7 GB |
+| **B=64 × 10K** (worst) | **655,360** | **~172 GB** |
+
+### Worst-corner total and why TP=4
+
+```
+Total (BF16, B=64 × 10K)  ≈  (65.5 GB weights + 172 GB KV) × 1.15  ≈  273 GB
+```
+
+- **273 GB < 384 GB → fits**, but the KV alone (172 GB) and weights (65.5 GB) blow past a single
+  96 GB card. **TP=4** pools all 384 GB and shards both weights and KV across the 4 cards:
+  per card ≈ `65.5/4 + 172/4 + overhead ≈ 60 GB` < 96 GB (under the default 0.9 utilization budget).
+- Using one fixed TP=4 config for the whole sweep also keeps every `(B, K, S, prefix)` point directly comparable.
 
 ## 3. Takeaways
 
-- 384 GB makes VRAM a non-issue: **BF16 flash fits (~278 GB)** → no quantization required. INT8/INT4 only if we want headroom or want to *study* quantization.
-- KV is small (GQA, 4 KV heads): worst corner only ~42 GB.
-- Vanilla-AR emulation runs the whole sweep on a nano-vLLM-supported model **without implementing diffusion** — model choice still open.
+- 384 GB makes VRAM a non-issue: **BF16 fits (~273 GB worst corner)** → no quantization required.
+- KV is small *per token* thanks to GQA (8 KV heads, 256 KB/token); the worst corner is large only
+  because of `B=64 × 10K` (655K tokens).
+- The whole sweep runs on stock Qwen3-32B **without implementing diffusion** — the B/K/S pattern is emulated.
 
 ## Sources
 
 - KV cache formula: [Brenndoerfer](https://mbrenndoerfer.com/writing/kv-cache-memory-calculation-llm-inference-gpu), [Lyceum Technology](https://lyceum.technology/magazine/kv-cache-memory-calculation-llm/)
 - VRAM = weights + KV + overhead: [BentoML LLM Inference Handbook](https://bentoml.com/llm/getting-started/calculating-gpu-memory-for-llms), [Anyscale Docs](https://docs.anyscale.com/llm/batch-inference/resource-allocation/gpu-memory)
 - INT4 / INT8 quantization: [VRLA Tech](https://vrlatech.com/llm-quantization-explained-int4-int8-fp8-awq-and-gptq-in-2026/), [Hivenet](https://www.hivenet.com/post/llm-quantization-guide)
-- LLaDA 2.0: [arXiv 2512.15745](https://arxiv.org/abs/2512.15745), [HF LLaDA2.0-flash](https://huggingface.co/inclusionAI/LLaDA2.0-flash), [GitHub inclusionAI/LLaDA2.X](https://github.com/inclusionAI/LLaDA2.X)
+- Qwen3-32B: [HF Qwen/Qwen3-32B](https://huggingface.co/Qwen/Qwen3-32B)
