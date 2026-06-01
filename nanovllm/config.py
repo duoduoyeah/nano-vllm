@@ -16,6 +16,8 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    decode_k: int = 1   # query positions per seq per decode forward (K-over-S multi-token; 1 = vanilla AR)
+    shm_name: str = "nanovllm"   # TP command-buffer name; LLMEngine makes it unique per process
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

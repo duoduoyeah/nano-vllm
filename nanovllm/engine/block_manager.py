@@ -107,6 +107,14 @@ class BlockManager:
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
 
+    def append_blocks(self, seq: Sequence, k: int):
+        # Multi-token (K-over-S) decode: ensure block_table covers seq.num_tokens + k positions.
+        # Allocates whole blocks as needed; _allocate_block() raises if the KV cache is exhausted
+        # (popleft on empty deque -> IndexError), which bench_decode records as OOM.
+        needed = (seq.num_tokens + k + self.block_size - 1) // self.block_size
+        while len(seq.block_table) < needed:
+            seq.block_table.append(self._allocate_block())
+
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size

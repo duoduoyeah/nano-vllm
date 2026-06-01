@@ -40,11 +40,11 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
+                self.shm = SharedMemory(name=config.shm_name, create=True, size=2**20)
                 dist.barrier()
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
+                self.shm = SharedMemory(name=config.shm_name)
                 self.loop()
 
     def exit(self):
@@ -187,6 +187,40 @@ class ModelRunner:
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
+    def prepare_decode_k(self, seqs: list[Sequence], k: int):
+        # Multi-token (K-over-S) decode: k query positions/seq at [L, L+k) attending CAUSALLY to
+        # [0, L+k) via the DECODE path (flash_attn_with_kvcache, seqlen_q=k) — which is cudagraph-able,
+        # unlike the eager prefill/varlen path. The k new positions' KV is stored (slot_mapping) and
+        # cache_seqlens=L+k. Placeholder ids (not a quality test); the driver advances seq.num_tokens
+        # by k only after the S steps, so during the S steps the same [L, L+k) slots are re-written.
+        input_ids = []
+        positions = []
+        slot_mapping = []
+        context_lens = []
+        for seq in seqs:
+            L = seq.num_tokens                       # committed length; KV cached for [0, L)
+            input_ids.extend([seq.last_token] * k)   # placeholder query ids
+            positions.extend(range(L, L + k))
+            context_lens.append(L + k)               # queries attend to [0, L+k)
+            for pos in range(L, L + k):
+                slot_mapping.append(seq.block_table[pos // self.block_size] * self.block_size + pos % self.block_size)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(seqs)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        return input_ids, positions
+
+    @torch.inference_mode()
+    def run_block_decode(self, seqs: list[Sequence], k: int):
+        # One K-over-S forward over k query positions/seq, via run_model -> cudagraph replay when the
+        # graphs were captured for decode_k=k. Logits are computed and discarded (timing only; no sampling).
+        input_ids, positions = self.prepare_decode_k(seqs, k)
+        self.run_model(input_ids, positions, False)
+        reset_context()
+        return None
+
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
@@ -194,22 +228,23 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        k = self.config.decode_k                 # query positions per seq (1 = vanilla AR)
+        bs = input_ids.size(0) // k              # actual batch (graphs are keyed by bs, sized bs*k)
+        if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
-            bs = input_ids.size(0)
             context = get_context()
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
+            graph_vars["input_ids"][:bs * k] = input_ids
+            graph_vars["positions"][:bs * k] = positions
             graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
+            graph_vars["slot_mapping"][:bs * k] = context.slot_mapping
             graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+            return self.model.compute_logits(graph_vars["outputs"][:bs * k])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
@@ -223,24 +258,29 @@ class ModelRunner:
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
+        k = config.decode_k                       # query positions/seq; graphs capture seqlen_q=k (1 = vanilla)
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-        input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+        input_ids = torch.zeros(max_bs * k, dtype=torch.int64)
+        positions = torch.zeros(max_bs * k, dtype=torch.int64)
+        slot_mapping = torch.zeros(max_bs * k, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        outputs = torch.zeros(max_bs * k, hf_config.hidden_size)
+        # Cap captured graphs by total rows (bs*k): large-K graphs (e.g. K=256 -> bs*256) would blow
+        # up capture memory. Batches beyond the cap fall back to eager in run_model — fine for large K
+        # (few forwards, so per-launch overhead is negligible vs the big forward itself).
+        max_graph_rows = 8192
+        self.graph_bs = [bs for bs in ([1, 2, 4, 8] + list(range(16, max_bs + 1, 16))) if bs * k <= max_graph_rows] or [1]
         self.graphs = {}
         self.graph_pool = None
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            set_context(False, slot_mapping=slot_mapping[:bs * k], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            outputs[:bs * k] = self.model(input_ids[:bs * k], positions[:bs * k])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+                outputs[:bs * k] = self.model(input_ids[:bs * k], positions[:bs * k])    # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
