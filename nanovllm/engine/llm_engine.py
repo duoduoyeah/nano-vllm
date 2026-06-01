@@ -119,6 +119,60 @@ class LLMEngine:
         peak_gb = torch.cuda.max_memory_allocated() / 1e9
         return decode_time, peak_gb
 
+    def kovers_decode_vark(self, schedule: list[list[int]], output_len: int):
+        """Ragged variable-K decode benchmark (S=1) — see experiments/kovers_impl.md.
+
+        `schedule` is a B x num_steps matrix; schedule[i][t] = tokens request i commits at step t.
+        Every ROW sums to output_len (each request finishes output_len) and, for the balanced schedule
+        that enables the single varlen cudagraph, every COLUMN sums to a constant total_q. Prefill is
+        untimed; the timed loop runs ONE ragged paged-varlen forward per step (S=1) and commits the
+        per-request ks[i] placeholder tokens. Returns (decode_time_s, peak_mem_gb_rank0)."""
+        bm = self.scheduler.block_manager
+        B = len(schedule)
+        num_steps = len(schedule[0])
+        assert all(len(r) == num_steps for r in schedule), "schedule rows must be equal length"
+        assert all(sum(r) == output_len for r in schedule), "every request must emit exactly output_len"
+
+        # Up-front KV-capacity check (clean OOM, not a mid-forward hang) — same guard as kovers_decode.
+        block_size = bm.block_size
+        need = sum((seq.num_tokens + output_len + block_size - 1) // block_size for seq in self.scheduler.waiting)
+        capacity = len(bm.free_block_ids) + len(bm.used_block_ids)
+        if need > capacity:
+            raise torch.cuda.OutOfMemoryError(f"KV cache too small: need {need} blocks, have {capacity}")
+
+        # 1. prefill (untimed) — reuse the scheduler's chunked prefill; do NOT append a token.
+        while self.scheduler.waiting:
+            seqs, is_prefill = self.scheduler.schedule()
+            if not is_prefill:   # KV pressure made prefill fall through to decode -> clean OOM
+                raise torch.cuda.OutOfMemoryError("prefill could not be scheduled (KV pressure)")
+            self.model_runner.call("run", seqs, True)
+            for seq in seqs:
+                seq.num_cached_tokens += seq.num_scheduled_tokens
+                seq.num_scheduled_tokens = 0
+        seqs = list(self.scheduler.running)
+        assert len(seqs) == B, f"schedule has {B} rows but {len(seqs)} running seqs"
+        for seq in seqs:
+            seq.is_prefill = False
+
+        # 2. timed ragged block decode (S=1: one forward per step, commit immediately)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        t0 = perf_counter()
+        for t in range(num_steps):
+            ks = [schedule[i][t] for i in range(B)]
+            for seq, k in zip(seqs, ks):
+                bm.append_blocks(seq, k)                       # blocks for [L, L+k) before the writes
+            self.model_runner.call("run_block_decode_varlen", seqs, ks)
+            if self.ps:
+                torch.cuda.synchronize()                       # TP shm-buffer lockstep (see kovers_decode)
+            for seq, k in zip(seqs, ks):                       # commit: advance each L by its own k
+                for _ in range(k):
+                    seq.append_token(seq.last_token)
+        torch.cuda.synchronize()
+        decode_time = perf_counter() - t0
+        peak_gb = torch.cuda.max_memory_allocated() / 1e9
+        return decode_time, peak_gb
+
     def reset(self):
         """Free all KV blocks and clear the scheduler queues so the engine can run another fresh
         config in-process (used by the per-(K,S) sweep to amortize the model load). Idempotent: a

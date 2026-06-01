@@ -206,3 +206,6 @@ experiments/slurm_logs/
 experiments/results/*.csv
 experiments/results/*.png
 experiments/results/parts/
+experiments/results/parts_vark/
+experiments/results/**/*.csv
+experiments/results/**/*.png

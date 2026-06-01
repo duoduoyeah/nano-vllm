@@ -34,7 +34,10 @@ class ModelRunner:
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
-            self.capture_cudagraph()
+            if config.decode_varlen:
+                self.capture_cudagraph_varlen()   # ragged variable-K decode (one graph, fixed total_q)
+            else:
+                self.capture_cudagraph()           # uniform K-over-S decode (graph per batch size)
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -55,6 +58,8 @@ class ModelRunner:
                 self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
+            if hasattr(self, "varlen_graph"):   # release the captured graph (holds NCCL comms) BEFORE
+                del self.varlen_graph, self.varlen_graph_vars   # destroy_process_group, else teardown hangs
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -221,6 +226,70 @@ class ModelRunner:
         reset_context()
         return None
 
+    def prepare_decode_varlen(self, seqs: list[Sequence], ks: list[int]):
+        # Ragged multi-token decode (variable K per request, S=1): seq i contributes ks[i] query
+        # positions [L_i, L_i+ks[i]) attending CAUSALLY to [0, L_i+ks[i]) via the paged VARLEN path
+        # (the is_prefill attention branch -> flash_attn_varlen_func + block_table; the only flash-attn
+        # API that takes ragged per-seq query lengths). total_q = sum(ks) is kept CONSTANT across steps
+        # by the balanced schedule so the single varlen cudagraph applies. Placeholder ids (cost only).
+        input_ids = []
+        positions = []
+        slot_mapping = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+        for seq, k in zip(seqs, ks):
+            L = seq.num_tokens                       # committed length; KV cached for [0, L)
+            input_ids.extend([seq.last_token] * k)   # placeholder query ids
+            positions.extend(range(L, L + k))
+            cu_seqlens_q.append(cu_seqlens_q[-1] + k)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + L + k)
+            max_seqlen_q = max(max_seqlen_q, k)
+            max_seqlen_k = max(max_seqlen_k, L + k)
+            for pos in range(L, L + k):
+                slot_mapping.append(seq.block_table[pos // self.block_size] * self.block_size + pos % self.block_size)
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(seqs)
+        # is_prefill=True routes attention to the varlen+paged branch; max_seqlen_q/k are read at
+        # capture and baked into the graph grid (replay stays within k_max / max_model_len).
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        return input_ids, positions
+
+    @torch.inference_mode()
+    def run_block_decode_varlen(self, seqs: list[Sequence], ks: list[int]):
+        # One ragged S=1 forward over sum(ks) query rows. Replays the varlen cudagraph when total_q/bs
+        # match the captured shapes (balanced-schedule case); else eager. compute_logits runs AFTER
+        # reset_context() (is_prefill=False) so it scores ALL sum(ks) rows -> same lm_head work as the
+        # uniform K path's bs*K rows (fair). Logits discarded (timing only; no sampling).
+        input_ids, positions = self.prepare_decode_varlen(seqs, ks)
+        total_q = input_ids.size(0)
+        graph = getattr(self, "varlen_graph", None)
+        use_graph = (not self.enforce_eager and graph is not None
+                     and total_q == self.varlen_graph_vars["total_q"]
+                     and len(seqs) == self.varlen_graph_vars["bs"])
+        if use_graph:
+            context = get_context()
+            gv = self.varlen_graph_vars
+            gv["input_ids"].copy_(input_ids)
+            gv["positions"].copy_(positions)
+            gv["slot_mapping"].copy_(context.slot_mapping)
+            gv["cu_seqlens_q"].copy_(context.cu_seqlens_q)
+            gv["cu_seqlens_k"].copy_(context.cu_seqlens_k)
+            gv["block_tables"].zero_()
+            gv["block_tables"][:, :context.block_tables.size(1)].copy_(context.block_tables)
+            graph.replay()
+            hidden = gv["outputs"]
+        else:
+            hidden = self.model(input_ids, positions)
+        reset_context()
+        self.model.compute_logits(hidden)
+        return None
+
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = [seq.temperature for seq in seqs]
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
@@ -294,4 +363,58 @@ class ModelRunner:
             context_lens=context_lens,
             block_tables=block_tables,
             outputs=outputs,
+        )
+
+    @torch.inference_mode()
+    def capture_cudagraph_varlen(self):
+        # ONE cudagraph for the RAGGED variable-K decode (S=1) via the paged VARLEN kernel
+        # (flash_attn_varlen_func + block_table = the is_prefill attention branch). Capturable because
+        # the balanced schedule fixes total query rows: q is a constant (total_q, H, D) buffer, the
+        # cu_seqlens_q/k are fixed-shape int buffers whose CONTENTS we overwrite per step, and we capture
+        # with max_seqlen_q = k_max (and max_seqlen_k = max_model_len) so the launch grid covers the
+        # widest step. The kernel's per-seq key loop reads cu_seqlens from GPU memory at replay, so
+        # growing context + varying K are handled inside the captured kernel -- the same property that
+        # lets the kvcache decode graph grow. If varlen can't be captured (host-side sync), the engine
+        # falls back to eager varlen in run_block_decode_varlen.
+        config = self.config
+        hf_config = config.hf_config
+        bs = min(config.max_num_seqs, 512)                  # fixed batch B (graph is keyed to it)
+        total_q = config.varlen_total_q or bs               # fixed query rows/step (balanced column sum)
+        k_max = config.varlen_k_max                          # widest per-seq K (grid bound)
+        max_ctx = config.max_model_len                       # widest L+K any step reaches (grid bound)
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+
+        input_ids = torch.zeros(total_q, dtype=torch.int64)
+        positions = torch.zeros(total_q, dtype=torch.int64)
+        slot_mapping = torch.zeros(total_q, dtype=torch.int32)
+        cu_seqlens_q = torch.zeros(bs + 1, dtype=torch.int32)
+        cu_seqlens_k = torch.zeros(bs + 1, dtype=torch.int32)
+        block_tables = torch.zeros(bs, max_num_blocks, dtype=torch.int32)
+        outputs = torch.zeros(total_q, hf_config.hidden_size)
+
+        # capture-time contents: a valid balanced split of total_q across the bs seqs (keys = q here;
+        # replay overwrites all of it -- only the SHAPES and the max_seqlen ints get baked into the graph).
+        cu = 0
+        for i in range(bs):
+            q_i = total_q // bs + (1 if i < total_q - (total_q // bs) * bs else 0)
+            positions[cu:cu + q_i] = torch.arange(q_i)
+            cu_seqlens_q[i + 1] = cu_seqlens_q[i] + q_i
+            cu_seqlens_k[i + 1] = cu_seqlens_k[i] + q_i
+            cu += q_i
+
+        self.graphs = {}                                     # kept so exit()'s `del self.graphs` holds
+        self.graph_pool = None
+        graph = torch.cuda.CUDAGraph()
+        set_context(True, cu_seqlens_q, cu_seqlens_k, k_max, max_ctx, slot_mapping, None, block_tables)
+        outputs[:] = self.model(input_ids, positions)        # warmup
+        with torch.cuda.graph(graph):
+            outputs[:] = self.model(input_ids, positions)    # capture
+        self.graph_pool = graph.pool()
+        self.varlen_graph = graph
+        torch.cuda.synchronize()
+        reset_context()
+        self.varlen_graph_vars = dict(
+            input_ids=input_ids, positions=positions, slot_mapping=slot_mapping,
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+            block_tables=block_tables, outputs=outputs, total_q=total_q, bs=bs,
         )
